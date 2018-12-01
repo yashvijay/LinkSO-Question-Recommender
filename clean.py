@@ -37,6 +37,6 @@ def lemmatize(word):
         return word
 
 def clean(data):
-    tokens = nltk.word_tokenize(data.lower())
+    tokens = nltk.word_tokenize(str(data).lower())
     tokens = [lemmatize(token) for token in tokens if token not in stopWords]
     return ' '.join(tokens)
