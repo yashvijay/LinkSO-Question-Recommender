@@ -8,11 +8,13 @@ from os.path import isfile, join
 from collections import defaultdict
 
 from gensim import corpora, models, similarities
+
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
 datadir="data/linkSO"
 qtype='python'
 lamda=10
+beta=100
 fields=['qHeader','qDescription','topVotedAnswer']
 coeffs=[0.4,0.5,0.1]
 
@@ -35,6 +37,8 @@ def prepare_corpus(datadir,qtype='python',recompute=False):
 	pdf = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_qid2all.txt"), sep ='\t', \
 	                    names = ['qID', 'qHeader', 'qDescription', 'topVotedAnswer', 'type'])
 	pdf['type']= qtype
+	pdf.loc[:,'text']=pdf['qHeader'].astype(str)+pdf['qDescription'].astype(str)+pdf['topVotedAnswer'].astype(str)
+	
 	if isfile(join(datadir,qtype+"_qa.dict")) and (recompute==False):
 		dictionary=corpora.Dictionary.load(join(datadir,qtype+"_qa.dict"))
 		with open(join(datadir,qtype+"_pwC.json"),'r') as f:
@@ -42,7 +46,6 @@ def prepare_corpus(datadir,qtype='python',recompute=False):
 		#corpus = MyCorpus(join(datadir,qtype+"_corpus.txt"),dictionary)
 	else:
 
-		pdf.loc[:,'text']=pdf['qHeader'].astype(str)+pdf['qDescription'].astype(str)+pdf['topVotedAnswer'].astype(str)
 
 		documents = pdf['text']
 		frequency = defaultdict(int)
@@ -85,8 +88,31 @@ def nDCG(l,n):
 		b+=sl[i]/np.log2(i+1)
 	return a/b
 
+def LDA(dictionary,pdf,numtopics=10,recompute=False):
+
+	if isfile(join(datadir,qtype+"_lda.model")) and (recompute==False):
+		lda = models.LdaModel.load(join(datadir,qtype+"_lda.model"))
+	else:
+
+		documents = pdf['text']
+
+		bowdocs = [dictionary.doc2bow(d.split()) for d in documents]
+		lda = models.LdaModel(bowdocs, num_topics=10)
+		lda.save(join(datadir,qtype+"_lda.model"))
+
+	return lda
+
+def topicsim(t1,t2):
+	d1,d2=list2dict(t1),list2dict(t2)
+	simscore=0
+	for t in d1:
+		simscore+=np.log(d1[t])+np.log(d2.get(t,0.001))
+		return simscore
+
 def main():
 	dictionary, pwC, pdf = prepare_corpus("data/linkSO",recompute=False)
+	lda=LDA(dictionary,pdf,numtopics=10)
+
 	valids = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_valid_qid.txt"), sep = '\t',\
 	                      names = ['qId'])
 	pyscore = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_cosidf.txt"), sep ='\t', \
@@ -95,8 +121,11 @@ def main():
 	print (valscore.columns)
 
 	mrr, ndcg5, ndcg10 = 0,0,0
-	for i in range(0,len(valscore),30):
+	numdocs=len(valscore)//30
+	numdocs=100
+	for i in range(0,numdocs*30,30):
 		q = pdf.loc[pdf['qID']==valscore.loc[i]['qID_1']]
+		qtopics = lda[dictionary.doc2bow(q['qDescription'].values[0].split())]
 		counts_q = list2dict(dictionary.doc2bow(q['qDescription'].values[0].split()) )
 		retrieval_list = []
 		for j in range(30):
@@ -111,18 +140,21 @@ def main():
 				pwQA = sum([(x[0]*x[2].get(w,0))/x[1] for x in dataqp])
 				psmooth = (lamda/(lenqp+lamda))*pwC[str(w)]+(lenqp/(lenqp+lamda))*pwQA
 				score+=counts_q[w]*np.log(psmooth)
+			qptopics = lda[dictionary.doc2bow(qp['text'].values[0].split())]
+			#print ("score: {}, simscore: {}, label: {}".format(score,topicsim(qtopics,qptopics),valscore.loc[i+j]['label'] ))
+			#score+=beta*topicsim(qtopics,qptopics)
 			retrieval_list.append((score,valscore.loc[i+j]['label']))
 		retrieval_list = sorted(retrieval_list,key= lambda x: x[0],reverse=True)
 		relevance_list = [x[1] for x in retrieval_list]
 		mrr+=MRR(relevance_list) 
 		ndcg5+=nDCG(relevance_list,5)
 		ndcg10+=nDCG(relevance_list,10)
-		print ("{}/{}".format(i/30,len(valscore)/30))
-	mrr/=(len(valscore)/30)
-	ndcg5/=(len(valscore)/30)
-	ndcg10/=(len(valscore)/30)
+		print ("{}/{}".format(i/30,numdocs))
+		#print ("-------------------------------------")
+	mrr/=(numdocs)
+	ndcg5/=(numdocs)
+	ndcg10/=(numdocs)
 	print ("scores-> mrr={}, ndcg5={}, ndcg10={}".format(mrr,ndcg5,ndcg10))
-
 
 if __name__ == '__main__':
 	main()
