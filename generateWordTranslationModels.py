@@ -21,7 +21,7 @@ question_id = 'qID'
 question_header = 'qHeader'
 question_description = 'qDescription'
 top_answer = 'topVotedAnswer'
-type = 'type'
+#type = 'type'
 question_id1 = 'qID1'
 question_id2 = 'qID2'
 score = 'score'
@@ -52,12 +52,12 @@ def generateModels(qtype):
 		q2header = str(q2_row[question_header].values[0]).split()
 		q2desc = str(q2_row[question_description].values[0]).split()
 		q2ans = str(q2_row[top_answer].values[0]).split()
-		print("\nQ1 Header:", q1header)
-		print("Q1 Desc:", q1desc)
-		print("Q1 Answer:", q1ans)
-		print("Q2:", q2header)
-		print("Q2 Desc:", q2desc)
-		print("Q2 Answer:", q2ans)
+		# print("\nQ1 Header:", q1header)
+		# print("Q1 Desc:", q1desc)
+		# print("Q1 Answer:", q1ans)
+		# print("Q2:", q2header)
+		# print("Q2 Desc:", q2desc)
+		# print("Q2 Answer:", q2ans)
 		bitext_qH_qH.append(AlignedSent(q1header, q2header))
 		bitext_qD_qD.append(AlignedSent(q1desc, q2desc))
 		bitext_qHqD_qHqD.append(AlignedSent(q1header + q1desc, q2header + q2desc))
