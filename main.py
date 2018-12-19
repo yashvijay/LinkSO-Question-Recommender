@@ -9,6 +9,11 @@ from os.path import isfile, join
 from collections import defaultdict
 import argparse,sys
 import copy
+from random import randint
+import random
+import csv
+import translation_lm
+from gensim.models import Word2Vec
 
 from gensim import corpora, models, similarities
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
@@ -19,6 +24,7 @@ def prepare_corpus(datadir,qtype='python',recompute=False):
 	                    names = ['qID', 'qHeader', 'qDescription', 'topVotedAnswer', 'type'])
 	pdf['type']= qtype
 	pdf.loc[:,'text']=pdf['qHeader'].astype(str)+pdf['qDescription'].astype(str)+pdf['topVotedAnswer'].astype(str)
+	pdf.loc[:,'question']=pdf['qHeader'].astype(str)+pdf['qDescription'].astype(str)
 	documents = pdf['text']
 	bowdocs = [d.split() for d in documents]
 	l=[len(d) for d in bowdocs]
@@ -86,12 +92,20 @@ def LDA(dictionary,pdf,path,numtopics=10,recompute=False):
 
 	return lda
 
-def topicsim(t1,t2):
+def vecsim(t1,t2):
 	d1,d2=list2dict(t1),list2dict(t2)
 	simscore=0
+	n1,n2=0,0
 	for t in d1:
-		simscore+=np.log(d1[t])+np.log(d2.get(t,0.001))
-		return simscore
+		simscore+=d1[t]*d2.get(t,0)
+		n1+=d1[t]**2
+	for t in d2:
+		n2+=d2[t]**2
+	simscore/=np.sqrt(n1*n2)
+	return simscore
+
+def cosinesim(a,b):
+	return np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b))
 
 def compute_scores(retrieval_list):
 	mrr, ndcg5, ndcg10 = 0,0,0
@@ -106,15 +120,19 @@ def compute_scores(retrieval_list):
 	ndcg10/=(len(retrieval_list)//30)
 	return mrr,ndcg5,ndcg10
 
-
 class ql_scorer:
-	def __init__(self,dictionary,pdf,pwC,args):
+	def __init__(self,name,dictionary,pdf,pwC,args):
+		self.name=name
 		self.pdf=pdf
 		self.pwC=pwC
 		self.lamda=args['lamda']
 		self.coeffs=args['coeffs']
 		self.fields=args['fields']
 		self.dictionary=dictionary
+		if self.name=='translm':
+			self.T=translation_lm.load_model_test('data/linkSO/modelQHQD_Model1_python.pk')
+		if self.name=='word2vec':
+			self.w2vmodel=Word2Vec.load("data/linkSO/{}_word2vec.model".format(args['qtype'])).wv
 
 
 	def train(self):
@@ -125,9 +143,11 @@ class ql_scorer:
 		pdf,pwC,lamda,coeffs,fields=self.pdf,self.pwC,self.lamda,self.coeffs,self.fields
 		dictionary=self.dictionary
 		retrieval_list=[]
+		passlist,faillist=[],[]
 		for i in range(0,numdocs*30,30):
 			q = pdf.loc[pdf['qID']==valscore.loc[i]['qID_1']]
-			counts_q = list2dict(dictionary.doc2bow(q['qDescription'].values[0].split()) )
+			counts_q = list2dict(dictionary.doc2bow(q['question'].values[0].split()) )
+			scorelist=[]
 			for j in range(30):
 				qp = pdf.loc[pdf['qID']==valscore.loc[i+j]['qID_2']]
 				dataqp,lenqp=[],0
@@ -137,19 +157,50 @@ class ql_scorer:
 					lenqp+=dataqp[-1][1]
 				score=0
 				for w in counts_q:
-					pwQA = sum([(x[0]*x[2].get(w,0))/x[1] for x in dataqp])
+					if self.name=='vanilla':
+						pwQA = sum([(x[0]*x[2].get(w,0))/x[1] for x in dataqp])
+					if self.name=='translm':
+						pwQA = 0
+						for itr in range(3):
+							tmp=0
+							for t in dataqp[itr][2]:
+								tmp+=dataqp[itr][2][t]*self.T[dictionary[w]][dictionary[t]]
+							pwQA+=dataqp[itr][0]*tmp/dataqp[itr][1]
+					if self.name=='word2vec':
+						pwQA = 0
+						for itr in range(3):
+							tmp=0
+							for t in dataqp[itr][2]:
+								if dictionary[w] in self.w2vmodel.vocab and dictionary[t] in self.w2vmodel.vocab:
+									tmp+=dataqp[itr][2][t]*cosinesim(self.w2vmodel[dictionary[w]],self.w2vmodel[dictionary[t]])
+							tmp=max(tmp,0)
+							pwQA+=dataqp[itr][0]*tmp/dataqp[itr][1]
 					psmooth = (lamda/(lenqp+lamda))*pwC[str(w)]+(lenqp/(lenqp+lamda))*pwQA
 					score+=counts_q[w]*np.log(psmooth)
 				retrieval_list.append((score,valscore.loc[i+j]['label']))
+				scorelist.append((score,valscore.loc[i+j]['label'],j))
+			scorelist=sorted(scorelist,key= lambda x: x[0],reverse=True)
+			for ind,ele in list(enumerate(scorelist)):
+				if ele[1]==1:
+					passlist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
+			for ind,ele in reversed(list(enumerate(scorelist))):
+				if ele[1]==1:
+					faillist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
+				
 			if (i//30)%(numdocs//10)==0:
 				print (i)
-		return retrieval_list
+		passlist=sorted(passlist,key=lambda x: x[0])[:10]
+		faillist=sorted(faillist,key=lambda x: x[0],reverse=True)[:10]
+		return retrieval_list,passlist,faillist
 
 class dg_scorer:
 	def __init__(self,name,tfidf,dictionary,pdf,args,avgdl):
 		self.name=name
 		self.pdf=pdf
-		self.k=args['k']
+		self.k1=args['k1']
+		self.k3=args['k3']
 		self.b=args['b']
 		self.dictionary=dictionary
 		self.tfidf=tfidf
@@ -161,14 +212,15 @@ class dg_scorer:
 
 	def rank(self,valscore):
 		numdocs=len(valscore)//30
-		pdf,k,b,tfidf=self.pdf,self.k,self.b,self.tfidf
+		pdf,k1,k3,b,tfidf=self.pdf,self.k1,self.k3,self.b,self.tfidf
 		dictionary,avgdl=self.dictionary,self.avgdl
 		retrieval_list=[]
+		passlist,faillist=[],[]
 		for i in range(0,numdocs*30,30):
 			q = pdf.loc[pdf['qID']==valscore.loc[i]['qID_1']]
-			q = dictionary.doc2bow(q['qDescription'].values[0].split())
-			counts_q = list2dict(q)
-			tfidf_q = list2dict(tfidf[q] )
+			counts_q = list2dict(dictionary.doc2bow(q['question'].values[0].split()))
+			#tfidf_q = list2dict(tfidf[q] )
+			scorelist=[]
 			for j in range(30):
 				qp = pdf.loc[pdf['qID']==valscore.loc[i+j]['qID_2']]
 				counts_qp = list2dict(dictionary.doc2bow(qp['text'].values[0].split()))
@@ -177,24 +229,45 @@ class dg_scorer:
 				for w in counts_q:
 					if self.name=='rsj':
 						if w in counts_qp:
-							score+=tfidf_q[w]/counts_q[w]
+							#score+=tfidf_q[w]/counts_q[w]
+							score+=tfidf.idfs[w]
 					if self.name=='tfidf':
 						if w in counts_qp:
-							score+=tfidf_q[w]
+							#score+=tfidf_q[w]
+							score+=tfidf.idfs[w]*counts_q[w]
 					if self.name=='bm25':
-						score+=tfidf_q[w]*counts_qp.get(w,0)*(k+1)/(counts_qp.get(w,0)+k*(1-b+b*len_qp/avgdl))
+						#score+=tfidf_q[w]*counts_qp.get(w,0)*(k+1)/(counts_qp.get(w,0)+k*(1-b+b*len_qp/avgdl))
+						score+=tfidf.idfs[w]*counts_qp.get(w,0)*(k1+1)/(counts_qp.get(w,0)+k1*(1-b+b*len_qp/avgdl))
+					if self.name=='bm255':
+						score+=tfidf.idfs[w]*(counts_qp.get(w,0)*(k1+1)/(counts_qp.get(w,0)+k1*(1-b+b*len_qp/avgdl)))*counts_q[w]*(k3+1)/(counts_q[w]+k3)
 				retrieval_list.append((score,valscore.loc[i+j]['label']))
+				scorelist.append((score,valscore.loc[i+j]['label'],j))
+			scorelist=sorted(scorelist,key= lambda x: x[0],reverse=True)
+			for ind,ele in list(enumerate(scorelist)):
+				if ele[1]==1:
+					# print(ind)
+					# print (q['question'].values[0])
+					# print (pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0])
+					passlist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
+			for ind,ele in reversed(list(enumerate(scorelist))):
+				if ele[1]==1:
+					faillist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
 			if (i//30)%(numdocs//10)==0:
 				print (i)
-		return retrieval_list
+		passlist=sorted(passlist,key=lambda x: x[0])[:10]
+		faillist=sorted(faillist,key=lambda x: x[0],reverse=True)[:10]
+		return retrieval_list,passlist,faillist
 
 class topic_scorer:
 	def __init__(self,dictionary,pdf,args):
 		self.pdf=pdf
 		self.dictionary=dictionary
+		self.args=args
 
 	def train(self,args,numtopics=100):
-		path=join("ldaModels",str(numtopics))
+		path=join("ldaModels","{}_{}".format(numtopics,self.args['qtype']))
 		self.lda=LDA(self.dictionary,self.pdf,path,numtopics=numtopics)
 
 	def rank(self,valscore):
@@ -202,218 +275,165 @@ class topic_scorer:
 		numdocs=len(valscore)//30
 		pdf,lda,dictionary=self.pdf,self.lda,self.dictionary
 		retrieval_list = []
+		passlist,faillist=[],[]
 		for i in range(0,numdocs*30,30):
 			q = pdf.loc[pdf['qID']==valscore.loc[i]['qID_1']]
-			qtopics = lda[dictionary.doc2bow(q['qDescription'].values[0].split())]
+			qtopics = lda[dictionary.doc2bow(q['question'].values[0].split())]
+			scorelist=[]
 			for j in range(30):
 				qp = pdf.loc[pdf['qID']==valscore.loc[i+j]['qID_2']]
 				qptopics = lda[dictionary.doc2bow(qp['text'].values[0].split())]
-				score=topicsim(qtopics,qptopics)
+				score=vecsim(qtopics,qptopics)
 				retrieval_list.append((score,valscore.loc[i+j]['label']))
+				scorelist.append((score,valscore.loc[i+j]['label'],j))
+			scorelist=sorted(scorelist,key= lambda x: x[0],reverse=True)
+			for ind,ele in list(enumerate(scorelist)):
+				if ele[1]==1:
+					passlist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
+			for ind,ele in reversed(list(enumerate(scorelist))):
+				if ele[1]==1:
+					faillist.append((ind,q['question'].values[0],pdf.loc[pdf['qID']==valscore.loc[i+ele[2]]['qID_2']]['text'].values[0]))
+					break
 			if (i//30)%(numdocs//10)==0:
 				print (i)
-		return retrieval_list
+		passlist=sorted(passlist,key=lambda x: x[0])[:10]
+		faillist=sorted(faillist,key=lambda x: x[0],reverse=True)[:10]
+		return retrieval_list,passlist,faillist
 
 
 def main(args):
-	if sys.argv[1]=='showresults':
-		############document generation
-		with open("docGeneration_results.txt",'r') as f:
-			r=json.load(f)
-		print ('rsj: {}'.format(r['rsj']))
-		print ('tfidf:{}'.format(r['tfidf']))
-		ma,ik,ib=0,-1,-1
-		for k in r['bm25']['k']:
-			if r['bm25']['k'][k][0]>ma:
-				ma,ik=r['bm25']['k'][k][0],k
-		ma=0
-		for b in r['bm25']['b']:
-			if r['bm25']['b'][b][0]>ma:
-				ma,ib=r['bm25']['b'][b][0],b
-		if r['bm25']['k'][ik]>r['bm25']['b'][ib]:
-			print ('bm25: {} for k={} and b={}'.format(r['bm25']['k'][ik],ik,0.75))
-		if r['bm25']['k'][ik]<r['bm25']['b'][ib]:
-			print ('bm25: {} for k={} and b={}'.format(r['bm25']['b'][ib],1.2,ib))
-		lk=[k for k in r['bm25']['k']]
-		plt.plot(lk,[r['bm25']['k'][k][0] for k in lk])
-		plt.plot(lk,[r['bm25']['k'][k][1] for k in lk])
-		plt.plot(lk,[r['bm25']['k'][k][2] for k in lk])
-		plt.legend(['MRR','nDCG@5','nDCG@10'])
-		plt.title('effect of k in bm25')
-		plt.xlabel('k')
-		plt.savefig("bm25_k.png")
-		plt.show()
-		lb=[b for b in r['bm25']['b']]
-		plt.plot(lb,[r['bm25']['b'][b][0] for b in lb])
-		plt.plot(lb,[r['bm25']['b'][b][1] for b in lb])
-		plt.plot(lb,[r['bm25']['b'][b][2] for b in lb])
-		plt.legend(['MRR','nDCG@5','nDCG@10'])
-		plt.title('effect of b in bm25')
-		plt.xlabel('b')
-		plt.savefig("bm25_b.png")
-		plt.show()
-		##############query generation
-		with open("queryGeneration_results.txt",'r') as f:
-			r=json.load(f)
-		print ('query generation: {} for lamda=1 and coeffs=[0.33,0.33,0.33]'.format(r['lamda']['1']))
-		lk=[k for k in r['lamda']]
-		plt.plot(lk,[r['lamda'][k][0] for k in lk])
-		plt.plot(lk,[r['lamda'][k][1] for k in lk])
-		plt.plot(lk,[r['lamda'][k][2] for k in lk])
-		plt.legend(['MRR','nDCG@5','nDCG@10'])
-		plt.title('effect of lamda in query generation')
-		plt.xlabel('lamda')
-		plt.savefig("qg_lamda.png")
-		plt.show()
-		c=[5,5,5]
-
-		for i in range(3):
-			lb=[]
-			for j in [1,3,5,7,9]:
-				tmp=copy.deepcopy(c)
-				tmp[i]=j
-				lb.append(str(tmp[0])+"-"+str(tmp[1])+"-"+str(tmp[2]))
-			plt.plot(lb,[r['coeff'][b][0] for b in lb])
-			plt.plot(lb,[r['coeff'][b][1] for b in lb])
-			plt.plot(lb,[r['coeff'][b][2] for b in lb])
-			plt.legend(['MRR','nDCG@5','nDCG@10'])
-			plt.title('effect of coefficient of {} in query generation'.format(args['fields'][i]))
-			plt.xlabel('value')
-			plt.savefig("qg_"+str(i)+".png")
-			plt.show()
-		##################topics
-		r=json.load(open("topic_results.txt",'r'))
-		print ('topic based: {} for numtopics=90'.format(r['90']))
-		lk=[k for k in r]
-		plt.plot(lk,[r[k][0] for k in lk])
-		plt.plot(lk,[r[k][1] for k in lk])
-		plt.plot(lk,[r[k][2] for k in lk])
-		plt.legend(['MRR','nDCG@5','nDCG@10'])
-		plt.title('effect of number of topics')
-		plt.xlabel('number of topics')
-		plt.savefig("topics.png")
-		plt.show()
-		return
 		
+	with open("quantitative_analysis.csv",'w') as f:
+		f.write("")
 
-	datadir=args['datadir']
-	qtype=args['qtype']
+	with open("quantitative_analysis.csv",'a') as f:
+		writer = csv.writer(f)
+		writer.writerow(['qtype','method','params','mrr','ndcg5','ndcg10'])
 
-	dictionary, pwC, pdf, tfidf, avgdl = prepare_corpus(datadir,recompute=False)
+		datadir=args['datadir']
 
-	testids = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_valid_qid.txt"), sep = '\t',\
-	                      names = ['qId'])
-	pyscore = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_cosidf.txt"), sep ='\t', \
-	                    names = ['qID_1', 'qID_2', 'score', 'label'], skiprows=1)
-	testscore = pyscore.merge(testids,left_on='qID_1',right_on='qId',how='inner')
+		for qtype in ['java','javascript','python']:
+			args['qtype']=qtype
 
+			dictionary, pwC, pdf, tfidf, avgdl = prepare_corpus(datadir,qtype=qtype,recompute=False)
 
-	# s1=dg_scorer('bm25',tfidf,dictionary,pdf,args,avgdl)
-	# s1.train()
-	# rl1=s1.rank(testscore)
-	# mrr, ndcg5, ndcg10 = compute_scores(rl1)
-	# print ("mrr,ndcg5,ndcg10 for ql_scorer: {} {} {}".format(mrr,ndcg5,ndcg10))
+			testids = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_valid_qid.txt"), sep = '\t',\
+			                      names = ['qId'])
+			pyscore = pd.read_csv(join(datadir,"linkso/topublish/"+qtype+"/"+qtype+"_cosidf.txt"), sep ='\t', \
+			                    names = ['qID_1', 'qID_2', 'score', 'label'], skiprows=1)
+			testscore = pyscore.merge(testids,left_on='qID_1',right_on='qId',how='inner')
 
-	# s1=ql_scorer(dictionary,pdf,pwC,args)
-	# s1.train()
-	# rl1=s1.rank(testscore)
-	# mrr, ndcg5, ndcg10 = compute_scores(rl1)
-	# print ("mrr,ndcg5,ndcg10 for ql_scorer: {} {} {}".format(mrr,ndcg5,ndcg10))
+			#generating results for query generation
+			#for method in ['word2vec','vanilla','translm']:
+			# for method in ['vanilla','translm']:
+			# 	if args['qtype']!='python' and method=='translm':
+			# 		continue
 
-	# s2=topic_scorer(dictionary,pdf,args)
-	# s2.train(args,numtopics=10)
-	# rl2=s2.rank(testscore)
-	# mrr, ndcg5, ndcg10 = compute_scores(rl2)
-	# print ("mrr,ndcg5,ndcg10 for topic_scorer: {} {} {}".format(mrr,ndcg5,ndcg10))
+			# 	s1=ql_scorer(method,dictionary,pdf,pwC,args)
+			# 	s1.train()
+			# 	rl1,var1,var2=s1.rank(testscore)
+			# 	if qtype=='python':
+			# 		with open("quals_{}.txt".format(method),'w') as f:
+			# 			f.write("positive samples:\n")
+			# 			for r,q1,q2 in var1:
+			# 				f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
+			# 			f.write("negative samples:\n")
+			# 			for r,q1,q2 in var2:
+			# 				f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
+			# 	mrr, ndcg5, ndcg10 = compute_scores(rl1)
+			# 	c1,c2,c3=args['coeffs']
+			# 	print ([qtype,method,'lamda={},c1={},c2={},c3={}'.format(args['lamda'],c1,c2,c3),mrr,ndcg5,ndcg10])
+			# 	writer.writerow([qtype,method,'lamda={},c1={},c2={},c3={}'.format(args['lamda'],c1,c2,c3),mrr,ndcg5,ndcg10])
 
-	# rl3=[(rl1[i][0]+args['beta']*rl2[i][0],rl1[i][1]) for i in range(rl1)]
-	# mrr, ndcg5, ndcg10 = compute_scores(rl3)
-	# print ("mrr,ndcg5,ndcg10 for combination: {} {} {}".format(mrr,ndcg5,ndcg10))	
+			#generating results for topic matching
+			# mrr,ndcg5,ndcg10=3,4,5
+			# for numtopics in [10,50,100,150,200]:
+			# 	s2=topic_scorer(dictionary,pdf,args)
+			# 	s2.train(args,numtopics=numtopics)
+			# 	rl2,var1,var2=s2.rank(testscore)
+			# 	if numtopics==10 and qtype=='python':
+			# 		with open("quals_topics.txt",'w') as f:
+			# 			f.write("positive samples:\n")
+			# 			for r,q1,q2 in var1:
+			# 				f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
+			# 			f.write("negative samples:\n")
+			# 			for r,q1,q2 in var2:
+			# 				f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
+			# 	mrr, ndcg5, ndcg10 = compute_scores(rl2)
+			# 	print ([qtype,'topics','numtopics={}'.format(numtopics),mrr,ndcg5,ndcg10])
+			# 	writer.writerow([qtype,'topics','numtopics={}'.format(numtopics),mrr,ndcg5,ndcg10])
 
-	if sys.argv[1]=='topics':
-		results={}
-		for numtopics in range(10,100,10):
-			s2=topic_scorer(dictionary,pdf,args)
-			s2.train(args,numtopics=numtopics)
-			rl2=s2.rank(testscore)
-			mrr, ndcg5, ndcg10 = compute_scores(rl2)
-			results[numtopics]=(mrr,ndcg5,ndcg10)
-		with open("topic_results.txt",'w') as f:
-			json.dump(results,f)
-
-	if sys.argv[1]=='qg':
-		results={}
-		lamdadict={}
-		for lamda in [1,5,10,15,20]:
-			args['lamda']=lamda
-			s1=ql_scorer(dictionary,pdf,pwC,args)
-			s1.train()
-			rl1=s1.rank(testscore)
-			mrr, ndcg5, ndcg10 = compute_scores(rl1)
-			lamdadict[lamda]=(mrr,ndcg5,ndcg10)
-		args['lamda']=10
-		results['lamda']=lamdadict
-		coeffdict={}
-		coeffs=[5,5,5]
-		for j in range(3):
-			for i in [1,3,5,7,9]:
-				args['coeffs']=copy.deepcopy(coeffs)
-				args['coeffs'][j]=i
-				s=sum(args['coeffs'])
-				l=[str(x) for x in args['coeffs']]
-				args['coeffs']=[x/s for x in args['coeffs']]
-				s1=ql_scorer(dictionary,pdf,pwC,args)
+			#generating results for document generation
+			for method in ['rsj','tfidf','bm25','bm255']:
+				s1=dg_scorer(method,tfidf,dictionary,pdf,args,avgdl)
 				s1.train()
-				rl1=s1.rank(testscore)
+				rl1,var1,var2=s1.rank(testscore)
+				if qtype=='python':
+					with open("quals_{}.txt".format(method),'w') as f:
+						f.write("positive samples:\n")
+						for r,q1,q2 in var1:
+							f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
+						f.write("negative samples:\n")
+						for r,q1,q2 in var2:
+							f.write("{}    -------    {}    ------   {}\n".format(r,q1,q2))
 				mrr, ndcg5, ndcg10 = compute_scores(rl1)
-				coeffdict[l[0]+"-"+l[1]+"-"+l[2]]=(mrr,ndcg5,ndcg10)
-		results['coeff']=coeffdict
-		with open("queryGeneration_results.txt",'w') as f:
-			json.dump(results,f)
+				print ([qtype,method,'',mrr,ndcg5,ndcg10])
+				writer.writerow([qtype,method,'',mrr,ndcg5,ndcg10])
 
 
-	if sys.argv[1]=='dg':
-		results={}
-		for method in ['rsj','tfidf']:
-			s1=dg_scorer(method,tfidf,dictionary,pdf,args,avgdl)
-			s1.train()
-			rl1=s1.rank(testscore)
-			mrr, ndcg5, ndcg10 = compute_scores(rl1)
-			results[method]=(mrr,ndcg5,ndcg10)
-		bm25results={}
-		kdict,bdict={},{}
-		for k in [0.8,1.0,1.2,1.4,1.6]:
-			args['k']=k
-			s1=dg_scorer('bm25',tfidf,dictionary,pdf,args,avgdl)
-			s1.train()
-			rl1=s1.rank(testscore)
-			mrr, ndcg5, ndcg10 = compute_scores(rl1)
-			kdict[k]=(mrr,ndcg5,ndcg10)
-		args['k']=1.2
-		for b in [0.5,0.6,0.75,0.9,1]:
-			args['b']=b
-			s1=dg_scorer('bm25',tfidf,dictionary,pdf,args,avgdl)
-			s1.train()
-			rl1=s1.rank(testscore)
-			mrr, ndcg5, ndcg10 = compute_scores(rl1)
-			bdict[b]=(mrr,ndcg5,ndcg10)
-		bm25results['k']=kdict
-		bm25results['b']=bdict
-		results['bm25']=bm25results
-		with open("docGeneration_results.txt",'w') as f:
-			json.dump(results,f)
 
-			
+			#tuning lamda and coeffs in qg
+			# for lamda in [0.000001,0.00001,0.0001,0.001,0.01]:
+			# 	args['lamda']=lamda
+			# 	s1=ql_scorer('vanilla',dictionary,pdf,pwC,args)
+			# 	s1.train()
+			# 	rl1,var1,var2=s1.rank(testscore)
+			# 	mrr, ndcg5, ndcg10 = compute_scores(rl1)
+			# 	c1,c2,c3=args['coeffs']
+			# 	print ([qtype,'vanilla','lamda={},c1={},c2={},c3={}'.format(lamda,c1,c2,c3),mrr,ndcg5,ndcg10])
+			# 	writer.writerow([qtype,'vanilla','lamda={},c1={},c2={},c3={}'.format(lamda,c1,c2,c3),mrr,ndcg5,ndcg10])
 
+			# args['lamda']=0.001
+			# coeffs=[5,5,5]
+			# for _ in range(5):
+			# 	args['coeffs']=copy.deepcopy(coeffs)
+			# 	args['coeffs'][0]=randint(1,20)
+			# 	args['coeffs'][1]=randint(50,80)
+			# 	args['coeffs'][2]=randint(20,40)
+			# 	s=sum(args['coeffs'])
+			# 	l=[str(x) for x in args['coeffs']]
+			# 	args['coeffs']=[x/s for x in args['coeffs']]
+			# 	s1=ql_scorer('vanilla',dictionary,pdf,pwC,args)
+			# 	s1.train()
+			# 	rl1,var1,var2=s1.rank(testscore)
+			# 	mrr, ndcg5, ndcg10 = compute_scores(rl1)
+			# 	c1,c2,c3=args['coeffs']
+			# 	print ([qtype,'vanilla','lamda={},c1={},c2={},c3={}'.format(1,c1,c2,c3),mrr,ndcg5,ndcg10])
+			# 	writer.writerow([qtype,'vanilla','lamda={},c1={},c2={},c3={}'.format(1,c1,c2,c3),mrr,ndcg5,ndcg10])
+			# args['coeffs']=[0.1,0.6,0.3]
+
+
+
+
+			# for _ in range(50):
+			# 	args['k']=random.uniform(0.1,5)
+			# 	args['b']=random.uniform(0,1)
+			# 	s1=dg_scorer('bm25',tfidf,dictionary,pdf,args,avgdl)
+			# 	s1.train()
+			# 	rl1=s1.rank(testscore)
+			# 	mrr, ndcg5, ndcg10 = compute_scores(rl1)
+			# 	writer.writerow([qtype,'bm25','k={},b={}'.format(args['k'],args['b']),mrr,ndcg5,ndcg10])
 
 if __name__ == '__main__':
 	args={}
 	args['datadir']="data/linkSO"
 	args['qtype']='python'
-	args['lamda']=10
+	args['lamda']=0.001
 	args['beta']=100
 	args['fields']=['qHeader','qDescription','topVotedAnswer']
-	args['coeffs']=[0.33,0.33,0.33]
-	args['k']=1.2
+	args['coeffs']=[0.1,0.6,0.3]
+	args['k1']=1.2
+	args['k3']=1.2
 	args['b']=0.75
 	main(args)

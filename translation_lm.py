@@ -148,7 +148,8 @@ def load_model_test(model_name):
 	with open(model_name, 'rb') as fin:
 		ibm1 = pickle.load(fin)
 	print("Loaded IBM Model:", model_name)
-	print(round(ibm1.translation_table['html']['web'], 10))
+	#print(round(ibm1.translation_table['html']['web'], 10))
+	return ibm1.translation_table
 
 if __name__ == '__main__':
 	main()
